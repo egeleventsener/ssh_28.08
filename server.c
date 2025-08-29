@@ -55,6 +55,15 @@ static void io_dprintf(client_t ch, const char *fmt, ...){
     int k = vsnprintf(tmp, sizeof tmp, fmt, ap); va_end(ap);
     if(k>0) ssh_channel_write(ch, tmp, (size_t)k);
 }
+static void drain_n(client_t c, long long n){
+    char b[4096];
+    while(n > 0){
+        size_t want = (size_t)(n > (long long)sizeof(b) ? sizeof(b) : n);
+        ssize_t r = io_read(c, b, want);
+        if(r <= 0) break;
+        n -= r;
+    }
+}
 
 static char BASE_DIR[PATH_MAX] = {0};
 static char START_DIR[PATH_MAX] = {0};
@@ -120,42 +129,30 @@ static int recv_line(client_t c, char *buf, size_t bufsz){
         if(u + 1 < bufsz) buf[u++] = ch;
     }
 }
-
-
-
-
 // Receive exactly N bytes and save to file
 static int recv_n_to_file(client_t c, const char* fname, long long nbytes) {
     FILE *fp = fopen(fname, "wb");
-    if (!fp) { perror("fopen for writing"); return -1; }
-
     char buf[4096];
     long long remaining = nbytes;
 
+    if (!fp) {
+        perror("fopen for writing");
+        drain_n(c, remaining);    // discard to resync
+        return -1;
+    }
     while (remaining > 0) {
-        size_t want = (remaining > (long long)sizeof(buf)) ? sizeof(buf) : (size_t)remaining;
+        size_t want = (size_t)(remaining > (long long)sizeof(buf) ? sizeof(buf) : remaining);
         ssize_t got = io_read(c, buf, want);
-        if (got <= 0) {
-            fprintf(stderr, "[Child %d] Receive error during file transfer\n", getpid());
-            fclose(fp);
-            unlink(fname);
-            return -1;
-        }
+        if (got <= 0) { fclose(fp); unlink(fname); drain_n(c, remaining); return -1; }
         if (fwrite(buf, 1, (size_t)got, fp) != (size_t)got) {
-            fprintf(stderr, "[Child %d] Write error during file transfer\n", getpid());
-            fclose(fp);
-            unlink(fname);
-            return -1;
+            fclose(fp); unlink(fname); remaining -= got; drain_n(c, remaining); return -1;
         }
         remaining -= got;
     }
-
     fclose(fp);
-    printf("[Child %d] File '%s' received successfully (%lld bytes)\n",
-        
-           getpid(), fname, nbytes);
     return 0;
 }
+
 
 // Handle individual commands from client, always end by printing "> "
 static void handle_command(client_t client, char *cmdline) {
@@ -257,34 +254,52 @@ static void handle_command(client_t client, char *cmdline) {
         return;
     }
 
-    // write_file  (then: <filename>\n  SIZE <n>\n  <n bytes>)
-    if (strcmp(cmdline, "write_file") == 0) {
-        char filename[PATH_MAX];
-        if (recv_line(client, filename, sizeof(filename)) < 0 || filename[0] == '\0') {
-            send_str(client, "Error: Could not receive filename\n");
-            send_str(client, "> ");
-            return;
-        }
-        char size_line[128];
-        if (recv_line(client, size_line, sizeof(size_line)) < 0) {
-            send_str(client, "Error: Could not receive file size\n");
-            send_str(client, "> ");
-            return;
-        }
-        long long file_size = -1;
-        if (sscanf(size_line, "SIZE %lld", &file_size) != 1 || file_size < 0) {
-            send_str(client, "Error: Invalid file size format\n");
-            send_str(client, "> ");
-            return;
-        }
-        printf("[Session] Receiving file '%s' of size %lld bytes\n", filename, file_size);
-        if (recv_n_to_file(client, filename, file_size) == 0)
-            send_str(client, "File uploaded successfully\n");
-        else
-            send_str(client, "File upload failed\n");
-        send_str(client, "> ");
-        return;
+    // write_file  (then: <path>\n  SIZE <n>\n  <n bytes>)
+if (strcmp(cmdline, "write_file") == 0) {
+    char path[PATH_MAX];
+    if (recv_line(client, path, sizeof(path)) < 0 || path[0] == '\0') {
+        send_str(client, "Error: Could not receive filename\n"); send_str(client, "> "); return;
     }
+
+    char size_line[128];
+    if (recv_line(client, size_line, sizeof(size_line)) < 0) {
+        send_str(client, "Error: Could not receive file size\n"); send_str(client, "> "); return;
+    }
+
+    long long nbytes = -1;
+    if (sscanf(size_line, "SIZE %lld", &nbytes) != 1 || nbytes < 0) {
+        send_str(client, "Error: Invalid file size format\n"); send_str(client, "> "); return;
+    }
+
+    /* reject obvious directory targets to avoid ENOTDIR; require a filename */
+    struct stat st;
+    if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
+        drain_n(client, nbytes);  // drain to resync
+        send_str(client, "Error: Target is a directory. Provide full file path (e.g. /dir/name.txt)\n");
+        send_str(client, "> "); return;
+    }
+
+    printf("[Session] Receiving file '%s' of size %lld bytes\n", path, nbytes);
+
+    if (nbytes == 0) {  // zero-byte file is allowed
+        FILE *fp = fopen(path, "wb");
+        if (!fp) {
+            perror("fopen for writing");
+            send_str(client, "File upload failed (open)\n"); send_str(client, "> "); return;
+        }
+        fclose(fp);
+        send_str(client, "File uploaded successfully\n"); send_str(client, "> "); return;
+    }
+
+    if (recv_n_to_file(client, path, nbytes) == 0)
+        send_str(client, "File uploaded successfully\n");
+    else
+        send_str(client, "File upload failed\n");
+
+    send_str(client, "> ");
+    return;
+}
+
 
     // Unknown
     send_str(client, "Unknown command\n");
