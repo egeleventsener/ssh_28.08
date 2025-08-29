@@ -89,33 +89,48 @@ static int chan_write_all(LIBSSH2_CHANNEL* ch, const char* buf, size_t len){
 }
 
 /* read and print any pending data for idle_window_ms without new bytes */
-static void chan_drain_print(int sock, LIBSSH2_SESSION* sess, LIBSSH2_CHANNEL* ch, int idle_window_ms){
-    char buf[8192];
-    int idle=0;
+static void chan_read_until_prompt(int sock, LIBSSH2_SESSION* sess, LIBSSH2_CHANNEL* ch, int timeout_ms){
+    char buf[4096];
+    char tail[4] = {0,0,0,0};   // sliding window to detect "\n> "
+    int idle = 0;
     for(;;){
         ssize_t n = libssh2_channel_read(ch, buf, sizeof(buf));
-        if(n>0){
-            fwrite(buf,1,(size_t)n,stdout); fflush(stdout);
-            idle=0;                      // got data; reset idle timer
+        if(n > 0){
+            fwrite(buf, 1, (size_t)n, stdout); fflush(stdout);
+            // update tail
+            for(ssize_t i=0;i<n;i++){
+                tail[0]=tail[1]; tail[1]=tail[2]; tail[2]=tail[3]; tail[3]=buf[i];
+                if(tail[0]=='\n' && tail[1]=='>'
+                   && (tail[2]==' ' || tail[2]=='\r' || tail[2]=='\n')) {
+                    return; // saw "\n> " (or CR/LF variants)
+                }
+                if((tail[2]=='\n' || tail[2]=='\r') && tail[3]=='>') {
+                    // handle case where prompt begins a new line as "> "
+                    // peek next read to print the following space if any, then return
+                    // but simplest: just return here; next command will print space anyway
+                    return;
+                }
+            }
+            idle = 0;
             continue;
         }
-        if(n==LIBSSH2_ERROR_EAGAIN){
+        if(n == LIBSSH2_ERROR_EAGAIN){
             waitsocket(sock, sess, 50);
-            idle+=50;
-            if(idle>=idle_window_ms) break;
+            idle += 50;
+            if(idle >= timeout_ms) return;
             continue;
         }
-        // n==0 no data and channel open; treat as idle
-        if(n==0){
+        if(n == 0){
             waitsocket(sock, sess, 50);
-            idle+=50;
-            if(idle>=idle_window_ms) break;
+            idle += 50;
+            if(idle >= timeout_ms) return;
             continue;
         }
-        // n<0 fatal
-        break;
+        // n < 0 fatal
+        return;
     }
 }
+
 
 /* ---------- local filesystem commands (client-side) ---------- */
 static void l_pwd(void){
@@ -198,7 +213,7 @@ static int send_file_protocol(int sock, LIBSSH2_SESSION* sess, LIBSSH2_CHANNEL* 
     fclose(f);
 
     // read server response
-    chan_drain_print(sock, sess, ch, 300);
+    chan_read_until_prompt(sock, sess, ch, 1000);
     return 0;
 }
 
@@ -271,41 +286,41 @@ int main(int argc, char** argv){
         if(strcmp(cmd,"pwd")==0){              // pwd -> spwd
             const char *out = "spwd\n";
             if(chan_write_all(ch, out, strlen(out))!=0){ fprintf(stderr,"write failed\n"); break; }
-            chan_drain_print(sock, sess, ch, 300);
+            chan_read_until_prompt(sock, sess, ch, 1000);
             continue;
         }
         if(strcmp(cmd,"ls")==0){               // ls -> sls
             const char *out = "sls\n";
             if(chan_write_all(ch, out, strlen(out))!=0){ fprintf(stderr,"write failed\n"); break; }
-            chan_drain_print(sock, sess, ch, 300);
+            chan_read_until_prompt(sock, sess, ch, 1000);
          continue;
         }
         if(strcmp(cmd,"cd")==0){               // cd X -> scd X
             if(!a1){ fprintf(stderr,"cd <dir>\n"); continue; }
             char out[4096]; snprintf(out,sizeof out,"scd %s\n", a1);
             if(chan_write_all(ch, out, strlen(out))!=0){ fprintf(stderr,"write failed\n"); break; }
-            chan_drain_print(sock, sess, ch, 300);
+            chan_read_until_prompt(sock, sess, ch, 1000);
             continue;
         }
         if(strcmp(cmd,"mkdir")==0){            // mkdir X -> smkdir X
             if(!a1){ fprintf(stderr,"mkdir <dir>\n"); continue; }
          char out[4096]; snprintf(out,sizeof out,"smkdir %s\n", a1);
           if(chan_write_all(ch, out, strlen(out))!=0){ fprintf(stderr,"write failed\n"); break; }
-          chan_drain_print(sock, sess, ch, 300);
+          chan_read_until_prompt(sock, sess, ch, 1000);
           continue;
         }
         if(strcmp(cmd,"rm")==0){               // rm X -> srm X
           if(!a1){ fprintf(stderr,"rm <path>\n"); continue; }
          char out[4096]; snprintf(out,sizeof out,"srm %s\n", a1);
           if(chan_write_all(ch, out, strlen(out))!=0){ fprintf(stderr,"write failed\n"); break; }
-         chan_drain_print(sock, sess, ch, 300);
+         chan_read_until_prompt(sock, sess, ch, 1000);
          continue;
         }
         if(strcmp(cmd,"rename")==0){           // rename A B -> srename A B
          if(!a1||!a2){ fprintf(stderr,"rename <old> <new>\n"); continue; }
          char out[4096]; snprintf(out,sizeof out,"srename %s %s\n", a1, a2);
           if(chan_write_all(ch, out, strlen(out))!=0){ fprintf(stderr,"write failed\n"); break; }
-          chan_drain_print(sock, sess, ch, 300);
+          chan_read_until_prompt(sock, sess, ch, 1000);
           continue;
         }
 
@@ -328,7 +343,7 @@ int main(int argc, char** argv){
             if(chan_write_all(ch, out, strlen(out))!=0){
                 fprintf(stderr,"write failed\n"); break;
             }
-            chan_drain_print(sock, sess, ch, 300);
+            chan_read_until_prompt(sock, sess, ch, 1000);
             continue;
         }
 
