@@ -101,30 +101,26 @@ static void send_str(client_t c, const char *s){
     io_write(c, s, strlen(s)); 
 }
 
-// Receive a line; end on '\r' or '\n'. Echo input and handle backspace.
-static int recv_line(client_t c, char *buf, size_t bufsz) {
+// end on \r or \n, no echo
+static int recv_line(client_t c, char *buf, size_t bufsz){
     size_t u = 0;
-    for (;;) {
+    for(;;){
         char ch;
         ssize_t r = io_read(c, &ch, 1);
-        if (r <= 0) return -1;
+        if(r <= 0) return -1;
 
-        if (ch == '\r' || ch == '\n') {
-            if (u < bufsz) buf[u] = '\0';
-            io_write(c, "\r\n", 2);          // show newline
+        if(ch == '\r' || ch == '\n'){
+            if(u < bufsz) buf[u] = '\0';
             return (int)u;
         }
-
-        // backspace / delete
-        if (ch == 0x7f || ch == 0x08) {
-            if (u > 0) { u--; io_write(c, "\b \b", 3); }
+        if((ch == 0x7f || ch == 0x08)){   // backspace: just edit buffer
+            if(u > 0) u--;
             continue;
         }
-
-        if (u + 1 < bufsz) buf[u++] = ch;   // store
-        io_write(c, &ch, 1);                // echo
+        if(u + 1 < bufsz) buf[u++] = ch;
     }
 }
+
 
 
 
@@ -304,8 +300,10 @@ static void handle_client(client_t client, struct sockaddr_in client_addr) {
         perror("chdir to base directory");
         exit(1);
     }
-    send_str(client, "Enter command:\n");
+    send_str(client, "Connected to the server \n");
+    send_str(client, "> ");
 
+    send_str(client, "Enter command:\n");
 
     char command_line[2048];
     for (;;) {
@@ -316,7 +314,9 @@ static void handle_client(client_t client, struct sockaddr_in client_addr) {
         }
         if (command_line[0] == '\0') {
             send_str(client, "Empty command received\n");
+            send_str(client, "> ");
             continue;
+
         }
         if (strcmp(command_line, "exit") == 0) {
             send_str(client, "Bye.\n");
