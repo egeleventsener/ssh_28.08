@@ -225,7 +225,7 @@ int main(int argc, char** argv){
     if(libssh2_init(0)!=0) die("libssh2_init");
     LIBSSH2_SESSION* sess = libssh2_session_init();
     if(!sess) die("session_init");
-    libssh2_session_set_blocking(sess, 0);
+    libssh2_session_set_blocking(sess, 1);
 
     if(libssh2_session_handshake(sess, sock)) die("handshake");
     if(libssh2_userauth_password(sess, user, pass)){
