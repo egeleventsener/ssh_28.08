@@ -295,7 +295,9 @@ static void handle_client(client_t client, struct sockaddr_in client_addr) {
     printf("[Session] Handling client %s:%d (tid=%lu)\n",
        inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port),
        (unsigned long)pthread_self());
-
+    send_str(client, "Connected to the server \n");
+    send_str(client, "> ");
+    send_str(client, "Enter command:\n");
     if (chdir(BASE_DIR) != 0) {
         perror("chdir to base directory");
         exit(1);
@@ -303,9 +305,6 @@ static void handle_client(client_t client, struct sockaddr_in client_addr) {
 
     char command_line[2048];
     for (;;) {
-        send_str(client, "Connected to the server \n");
-        send_str(client, "> ");
-        send_str(client, "Enter command:\n");
         int result = recv_line(client, command_line, sizeof(command_line));
         if (result <= 0) {
             printf("[Session] Client disconnected (tid=%lu)\n", (unsigned long)pthread_self());
