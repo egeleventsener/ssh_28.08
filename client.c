@@ -10,8 +10,12 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#pragma comment(lib,"ws2_32.lib")
-static void msleep(int ms){ Sleep(ms); }
+#include <direct.h>   // _getcwd, _mkdir
+#include <io.h>       // _unlink
+/* no pragmas for MinGW */
+#define close      closesocket
+#define unlink     _unlink
+#define getcwd     _getcwd
 #else
 #include <unistd.h>
 #include <fcntl.h>
@@ -20,7 +24,6 @@ static void msleep(int ms){ Sleep(ms); }
 #include <sys/select.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-static void msleep(int ms){ usleep(ms*1000); }
 #endif
 
 #include <dirent.h>
@@ -134,21 +137,22 @@ static void l_ls(void){
     }
     closedir(d);
 }
+/* local cd */
 static void l_cd(const char* dir){
     if(!dir||!*dir){ fprintf(stderr,"lcd <dir>\n"); return; }
-#ifdef _WIN32
-    if(_chdir(dir)!=0) perror("lcd");
-#else
     if(chdir(dir)!=0) perror("lcd");
-#endif
 }
+
+/* local mkdir */
+#ifdef _WIN32
+#define MKDIR(p) _mkdir(p)
+#else
+#define MKDIR(p) mkdir(p,0755)
+#endif
+
 static void l_mkdir(const char* d){
     if(!d||!*d){ fprintf(stderr,"lmkdir <dir>\n"); return; }
-#ifdef _WIN32
-    if(_mkdir(d)!=0) perror("lmkdir");
-#else
-    if(mkdir(d,0755)!=0) perror("lmkdir");
-#endif
+    if(MKDIR(d)!=0) perror("lmkdir");
 }
 static void l_rename(const char* a, const char* b){
     if(!a||!b){ fprintf(stderr,"lrename <old> <new>\n"); return; }
@@ -183,14 +187,14 @@ static int send_file_protocol(int sock, LIBSSH2_SESSION* sess, LIBSSH2_CHANNEL* 
 
     // stream file
     char buf[65536];
-    long long left = sz;
-    while(left>0){
-        size_t n = (size_t)((left>(long long)sizeof(buf))? sizeof(buf) : left);
-        size_t r = fread(buf,1,n,f);
-        if(r==0){ fclose(f); return -1; }
-        if(chan_write_all(ch, buf, r)!=0){ fclose(f); return -1; }
-        left -= (long long)r;
-    }
+        long long left = sz;
+        while (left > 0) {
+            size_t want = (size_t)((left > (long long)sizeof(buf)) ? sizeof(buf) : (size_t)left);
+            size_t r = fread(buf, 1, want, f);
+            if (r == 0) { fclose(f); return -1; }
+            if (chan_write_all(ch, buf, r) != 0) { fclose(f); return -1; }
+            left -= (long long)r;
+}
     fclose(f);
 
     // read server response
