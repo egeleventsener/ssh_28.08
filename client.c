@@ -178,48 +178,68 @@ static void l_rm(const char* p){
 }
 
 /* send local file to server using server's write_file protocol */
+/* send local file to server using our write_file protocol.
+   If remote_path ends with '/' or '\' (or is empty), append the local basename. */
 static int send_file_protocol(int sock, LIBSSH2_SESSION* sess, LIBSSH2_CHANNEL* ch,
-                              const char* local_path, const char* remote_path){
-    if(!remote_path || !*remote_path) remote_path = local_path;
+                              const char* local_path, const char* remote_path)
+{
+    if (!local_path || !*local_path) { fprintf(stderr, "send_file: missing local path\n"); return -1; }
 
-    /* robust file size via stat */
+    /* stat for size */
 #ifdef _WIN32
     struct _stat64 st;
-    if(_stat64(local_path, &st) != 0){ perror("stat local"); return -1; }
+    if (_stat64(local_path, &st) != 0) { perror("stat local"); return -1; }
     long long sz = (long long)st.st_size;
 #else
     struct stat st;
-    if(stat(local_path, &st) != 0){ perror("stat local"); return -1; }
+    if (stat(local_path, &st) != 0) { perror("stat local"); return -1; }
     long long sz = (long long)st.st_size;
 #endif
-    fprintf(stderr, "[client] sending '%s' -> '%s' size=%lld bytes\n",
-            local_path, remote_path, sz);
 
-    FILE* f = fopen(local_path,"rb");
-    if(!f){ perror("open local"); return -1; }
+    FILE* f = fopen(local_path, "rb");
+    if (!f) { perror("open local"); return -1; }
 
-    /* header: command, filename, size */
+    /* figure remote file name */
+    const char *base = strrchr(local_path, '\\');
+    if (!base) base = strrchr(local_path, '/');
+    base = base ? base + 1 : local_path;
+
+    char remote_fixed[4096];
+    if (!remote_path || !*remote_path) {
+        snprintf(remote_fixed, sizeof remote_fixed, "%s", base);
+    } else {
+        size_t rlen = strlen(remote_path);
+        if (remote_path[rlen-1] == '/' || remote_path[rlen-1] == '\\') {
+            snprintf(remote_fixed, sizeof remote_fixed, "%s%s", remote_path, base);
+        } else {
+            snprintf(remote_fixed, sizeof remote_fixed, "%s", remote_path);
+        }
+    }
+
+    /* header: command + filename + size */
     char hdr[4096];
-    int k = snprintf(hdr,sizeof hdr,"write_file\n%s\nSIZE %lld\n", remote_path, sz);
-    if(k <= 0 || k >= (int)sizeof(hdr)){ fclose(f); fprintf(stderr,"header error\n"); return -1; }
-    if(chan_write_all(ch, hdr, (size_t)k) != 0){ fclose(f); return -1; }
+    int k = snprintf(hdr, sizeof hdr, "write_file\n%s\nSIZE %lld\n", remote_fixed, sz);
+    if (k <= 0 || k >= (int)sizeof(hdr)) { fclose(f); fprintf(stderr, "header error\n"); return -1; }
 
-    /* stream file bytes exactly */
+    if (chan_write_all(ch, hdr, (size_t)k) != 0) { fclose(f); fprintf(stderr, "send header failed\n"); return -1; }
+
+    /* stream bytes */
     char buf[65536];
     long long left = sz;
-    while(left > 0){
+    while (left > 0) {
         size_t want = (size_t)((left > (long long)sizeof(buf)) ? sizeof(buf) : (size_t)left);
         size_t r = fread(buf, 1, want, f);
-        if(r == 0){ fclose(f); fprintf(stderr,"read local failed\n"); return -1; }
-        if(chan_write_all(ch, buf, r) != 0){ fclose(f); fprintf(stderr,"write remote failed\n"); return -1; }
+        if (r == 0) { fclose(f); fprintf(stderr, "read local failed\n"); return -1; }
+        if (chan_write_all(ch, buf, r) != 0) { fclose(f); fprintf(stderr, "write remote failed\n"); return -1; }
         left -= (long long)r;
     }
     fclose(f);
 
-    /* read server response until prompt */
+    /* read server reply until prompt */
     chan_read_until_prompt(sock, sess, ch, 2000);
     return 0;
 }
+
 
 /* ---------- main ---------- */
 static void usage(const char* prog){
