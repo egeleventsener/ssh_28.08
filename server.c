@@ -152,6 +152,7 @@ static int recv_n_to_file(client_t c, const char* fname, long long nbytes) {
 
     fclose(fp);
     printf("[Child %d] File '%s' received successfully (%lld bytes)\n",
+        
            getpid(), fname, nbytes);
     return 0;
 }
