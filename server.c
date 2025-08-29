@@ -18,12 +18,35 @@
 #include <stdarg.h>
 #include <libssh/libssh.h>
 #include <libssh/server.h>
+#include <pthread.h>
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
 
 typedef ssh_channel client_t;
+static void handle_client(client_t client, struct sockaddr_in client_addr);
+
+struct client_ctx {
+    ssh_session s;
+    ssh_channel ch;
+    struct sockaddr_in addr;
+};
+
+static void* client_main(void *arg){
+    struct client_ctx *ctx = (struct client_ctx*)arg;
+    handle_client(ctx->ch, ctx->addr);   // now matches prototype
+
+    ssh_channel_send_eof(ctx->ch);
+    ssh_channel_close(ctx->ch);
+    ssh_channel_free(ctx->ch);
+    ssh_disconnect(ctx->s);
+    ssh_free(ctx->s);
+    free(ctx);
+    return NULL;
+}
+
+
 
 static inline ssize_t io_read(client_t ch, void *buf, size_t n){ return ssh_channel_read(ch, buf, n, 0); }
 static inline ssize_t io_write(client_t ch, const void *buf, size_t n){ return ssh_channel_write(ch, buf, n); }
@@ -60,48 +83,50 @@ static int secure_path_in_base(const char* path) {
 // Secure directory change - prevents escaping from base directory
 static int secure_cd(const char *target) {
     if (!target || !*target) return -1;
-    char tmp[PATH_MAX];
-    
-    if (target[0] == '/') {
-        // Absolute path - prepend base directory
-        snprintf(tmp, sizeof(tmp), "%s%s", BASE_DIR, target);
-    } else {
-        // Relative path - append to current directory
-        if (!getcwd(tmp, sizeof(tmp))) return -1;
-        size_t len = strlen(tmp);
-        if (len + 1 < sizeof(tmp)) {
-            tmp[len] = '/';
-            tmp[len+1] = '\0';
-        }
-        strncat(tmp, target, sizeof(tmp) - strlen(tmp) - 1);
-    }
-    
-    // Resolve to canonical path and check security
-    char canon[PATH_MAX];
-    if (!realpath(tmp, canon)) return -1;
-    if (!secure_path_in_base(canon)) return -1;
-    if (chdir(canon) != 0) return -1;
-    return 0;
-}
+    char tmp[4096];
+    size_t bl = strnlen(BASE_DIR, sizeof(tmp) - 1);
+    int n = snprintf(tmp, sizeof(tmp), "%s%s%s",
+                     BASE_DIR,
+                     (((bl > 0) && (BASE_DIR[bl-1] == '/')) || (target[0] == '/')) ? "" : "/",
+                     target);
+    if (n < 0 || (size_t)n >= sizeof(tmp)) return -1;
 
+    char resolved[PATH_MAX];
+    if (!realpath(tmp, resolved)) return -1;
+    if (!secure_path_in_base(resolved)) return -1;
+    return chdir(resolved);
+}
 // Send string to client
 static void send_str(client_t c, const char *s){ 
     io_write(c, s, strlen(s)); 
 }
 
-// Receive a line from client (handles both \n and \r\n)
+// Receive a line; end on '\r' or '\n'. Echo input and handle backspace.
 static int recv_line(client_t c, char *buf, size_t bufsz) {
     size_t u = 0;
-    while (u + 1 < bufsz) {
+    for (;;) {
         char ch;
         ssize_t r = io_read(c, &ch, 1);
         if (r <= 0) return -1;
-        if (ch == '\n') { buf[u] = '\0'; return (int)u; }
-        if (ch != '\r') buf[u++] = ch;
+
+        if (ch == '\r' || ch == '\n') {
+            if (u < bufsz) buf[u] = '\0';
+            io_write(c, "\r\n", 2);          // show newline
+            return (int)u;
+        }
+
+        // backspace / delete
+        if (ch == 0x7f || ch == 0x08) {
+            if (u > 0) { u--; io_write(c, "\b \b", 3); }
+            continue;
+        }
+
+        if (u + 1 < bufsz) buf[u++] = ch;   // store
+        io_write(c, &ch, 1);                // echo
     }
-    buf[bufsz - 1] = '\0';
-    return (int)u;
 }
+
+
 
 // Receive exactly N bytes and save to file
 static int recv_n_to_file(client_t c, const char* fname, long long nbytes) {
@@ -238,19 +263,22 @@ static void handle_command(client_t client, char *cmdline) {
 
 // Handle a single client connection (runs in child process)
 static void handle_client(client_t client, struct sockaddr_in client_addr) {
-    printf("[Child %d] Handling client %s:%d\n",
-           getpid(), inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+    printf("[Session] Handling client %s:%d (tid=%lu)\n",
+       inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port),
+       (unsigned long)pthread_self());
 
     if (chdir(BASE_DIR) != 0) {
         perror("chdir to base directory");
         exit(1);
     }
+    send_str(client, "Enter command:\n");
+
 
     char command_line[2048];
     for (;;) {
         int result = recv_line(client, command_line, sizeof(command_line));
         if (result <= 0) {
-            printf("[Child %d] Client disconnected\n", getpid());
+            printf("[Session] Client disconnected (tid=%lu)\n", (unsigned long)pthread_self());
             break;
         }
         if (command_line[0] == '\0') {
@@ -260,8 +288,7 @@ static void handle_client(client_t client, struct sockaddr_in client_addr) {
         handle_command(client, command_line);
     }
 
-    printf("[Child %d] Client handler finished\n", getpid());
-    exit(0);
+        printf("[Session] Client handler finished (tid=%lu)\n", (unsigned long)pthread_self());
 }
 
 int main(void) {
@@ -316,30 +343,27 @@ int main(void) {
         for (ssh_message m; (m = ssh_message_get(s)) != NULL; ) {
             if (ssh_message_type(m) == SSH_REQUEST_AUTH &&
                 ssh_message_subtype(m) == SSH_AUTH_METHOD_PASSWORD) {
+
                 const char *u = ssh_message_auth_user(m);
-                /* Use newer API to avoid deprecation warning */
-                ssh_string pass_str = ssh_message_auth_password(s);
-                const char *p = pass_str ? ssh_string_to_char(pass_str) : NULL;
-                
+                const char *p = ssh_message_auth_password(m);  // returns const char*
+
                 if (u && p && strcmp(u, "ege") == 0 && strcmp(p, "test") == 0) {
                     ssh_message_auth_reply_success(m, 0);
-                    authed = 1;
-                    if (p) ssh_string_free_char((char*)p);
-                    if (pass_str) ssh_string_free(pass_str);
                     ssh_message_free(m);
+                    authed = 1;
                     break;
+                } else {
+                    ssh_message_auth_set_methods(m, SSH_AUTH_METHOD_PASSWORD);
+                    ssh_message_reply_default(m);
+                    ssh_message_free(m);
                 }
-                if (p) ssh_string_free_char((char*)p);
-                if (pass_str) ssh_string_free(pass_str);
-                ssh_message_auth_set_methods(m, SSH_AUTH_METHOD_PASSWORD);
-                ssh_message_reply_default(m);
             } else {
                 ssh_message_auth_set_methods(m, SSH_AUTH_METHOD_PASSWORD);
                 ssh_message_reply_default(m);
+                ssh_message_free(m);
             }
-            ssh_message_free(m);
         }
-        if (!authed) { ssh_disconnect(s); ssh_free(s); continue; }
+if (!authed) { ssh_disconnect(s); ssh_free(s); continue; }
 
         /* open session channel */
         ssh_channel ch = NULL;
@@ -386,34 +410,13 @@ int main(void) {
             }
         }
 
-        /* fork per client */
-        pid_t child_pid = fork();
-        if (child_pid == 0) {
-            /* child */
-            handle_client(ch, client_addr);
+        struct client_ctx *ctx = malloc(sizeof(*ctx));
+        ctx->s = s;
+        ctx->ch = ch;
+        ctx->addr = client_addr;
 
-            /* cleanups if handle_client returns */
-            ssh_channel_send_eof(ch);
-            ssh_channel_close(ch);
-            ssh_channel_free(ch);
-            ssh_disconnect(s);
-            ssh_free(s);
-            _exit(0);
-        } else if (child_pid > 0) {
-            /* parent */
-            printf("[Main] Forked child process %d for client\n", child_pid);
-            ssh_channel_close(ch);
-            ssh_channel_free(ch);
-            ssh_disconnect(s);
-            ssh_free(s);
-            continue;
-        } else {
-            perror("fork");
-            ssh_channel_close(ch);
-            ssh_channel_free(ch);
-            ssh_disconnect(s);
-            ssh_free(s);
-            continue;
+        pthread_t th;
+        pthread_create(&th, NULL, client_main, ctx);
+        pthread_detach(th);
         }
     }
-}

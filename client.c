@@ -1,450 +1,303 @@
-#include "delete_directory.h"
+// client.c — cross-platform libssh2 client with local+remote commands
 #define _GNU_SOURCE
-#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <limits.h>
+#include <string.h>
+#include <stdint.h>
 #include <errno.h>
-#include <unistd.h>
-#include <dirent.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <signal.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <stdarg.h>
-#include <libssh/libssh.h>
-#include <libssh/server.h>
+#include <time.h>
 
-#ifndef PATH_MAX
-#define PATH_MAX 4096
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib,"ws2_32.lib")
+static void msleep(int ms){ Sleep(ms); }
+#else
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/select.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+static void msleep(int ms){ usleep(ms*1000); }
 #endif
 
-typedef ssh_channel client_t;
+#include <dirent.h>
+#include <sys/stat.h>
 
-static inline ssize_t io_read(client_t ch, void *buf, size_t n){ return ssh_channel_read(ch, buf, n, 0); }
-static inline ssize_t io_write(client_t ch, const void *buf, size_t n){ return ssh_channel_write(ch, buf, n); }
-static void io_dprintf(client_t ch, const char *fmt, ...){
-    char tmp[8192]; va_list ap; va_start(ap, fmt);
-    int k = vsnprintf(tmp, sizeof tmp, fmt, ap); va_end(ap);
-    if(k>0) ssh_channel_write(ch, tmp, (size_t)k);
+#include <libssh2.h>
+
+static void die(const char* msg){
+    fprintf(stderr,"ERROR: %s\n", msg);
+    exit(1);
 }
 
-static char BASE_DIR[PATH_MAX] = {0};
-static char START_DIR[PATH_MAX] = {0};
-
-// Signal handler to clean up zombie processes (child processes that finished)
-static void sigchld_handler(int sig) {
-    (void)sig; // Suppress unused parameter warning
-    // Clean up all finished child processes
-    while (waitpid(-1, NULL, WNOHANG) > 0) {
-        // Just cleaning up zombies, no action needed
+/* ---------- socket helpers ---------- */
+static int tcp_connect(const char* host, int port){
+#ifdef _WIN32
+    WSADATA wsa; WSAStartup(MAKEWORD(2,2), &wsa);
+#endif
+    char portstr[16]; snprintf(portstr,sizeof portstr,"%d",port);
+    struct addrinfo hints={0}, *res=0,*rp=0; hints.ai_socktype=SOCK_STREAM; hints.ai_family=AF_UNSPEC;
+    if(getaddrinfo(host, portstr, &hints, &res)!=0) die("getaddrinfo");
+    int s=-1;
+    for(rp=res; rp; rp=rp->ai_next){
+        s=(int)socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if(s<0) continue;
+        if(connect(s, rp->ai_addr, (int)rp->ai_addrlen)==0) break;
+#ifdef _WIN32
+        closesocket(s);
+#else
+        close(s);
+#endif
+        s=-1;
     }
+    freeaddrinfo(res);
+    if(s<0) die("connect");
+    return s;
 }
 
-static int starts_with(const char* s, const char* p) {
-    return strncmp(s, p, strlen(p)) == 0;
+/* libssh2 wait helper for nonblocking reads */
+static int waitsocket(int socket_fd, LIBSSH2_SESSION *session, int timeout_ms){
+    struct timeval tv; fd_set fds; fd_set fds_err;
+    tv.tv_sec  = timeout_ms/1000;
+    tv.tv_usec = (timeout_ms%1000)*1000;
+
+    FD_ZERO(&fds); FD_ZERO(&fds_err);
+    FD_SET(socket_fd, &fds); FD_SET(socket_fd, &fds_err);
+
+    int dir = libssh2_session_block_directions(session);
+    int ret = select(socket_fd+1,
+                     (dir & LIBSSH2_SESSION_BLOCK_INBOUND ) ? &fds : NULL,
+                     (dir & LIBSSH2_SESSION_BLOCK_OUTBOUND) ? &fds : NULL,
+                     &fds_err, &tv);
+    return ret;
 }
 
-// Check if path is within our allowed base directory (security measure)
-static int secure_path_in_base(const char* path) {
-    char canon[PATH_MAX];
-    if (!realpath(path, canon)) return 0;
-    size_t b = strlen(BASE_DIR);
-    return (strncmp(canon, BASE_DIR, b) == 0) && (canon[b] == '/' || canon[b] == '\0');
-}
-
-// Secure directory change - prevents escaping from base directory
-static int secure_cd(const char *target) {
-    if (!target || !*target) return -1;
-    
-    // Check path lengths to prevent buffer overflow
-    size_t target_len = strlen(target);
-    size_t base_len = strlen(BASE_DIR);
-    
-    if (target_len >= PATH_MAX || base_len >= PATH_MAX) return -1;
-    if (target_len + base_len >= PATH_MAX) return -1;
-    
-    char tmp[PATH_MAX * 2]; // Double size to be safe
-    
-    if (target[0] == '/') {
-        // Absolute path - prepend base directory
-        if (snprintf(tmp, sizeof(tmp), "%s%s", BASE_DIR, target) >= (int)sizeof(tmp)) {
-            return -1; // Path too long
-        }
-    } else {
-        // Relative path - append to current directory
-        if (!getcwd(tmp, sizeof(tmp))) return -1;
-        size_t len = strlen(tmp);
-        if (len + 1 + target_len >= sizeof(tmp)) return -1;
-        
-        tmp[len] = '/';
-        tmp[len+1] = '\0';
-        strncat(tmp, target, sizeof(tmp) - len - 2);
+/* write all to channel */
+static int chan_write_all(LIBSSH2_CHANNEL* ch, const char* buf, size_t len){
+    while(len){
+        ssize_t n = libssh2_channel_write(ch, buf, (unsigned)len);
+        if(n<0) return (int)n;
+        buf += n; len -= n;
     }
-    
-    // Resolve to canonical path and check security
-    char canon[PATH_MAX];
-    if (!realpath(tmp, canon)) return -1;
-    if (!secure_path_in_base(canon)) return -1;
-    if (chdir(canon) != 0) return -1;
     return 0;
 }
 
-// Send string to client
-static void send_str(client_t c, const char *s){ 
-    io_write(c, s, strlen(s)); 
+/* read and print any pending data for idle_window_ms without new bytes */
+static void chan_drain_print(int sock, LIBSSH2_SESSION* sess, LIBSSH2_CHANNEL* ch, int idle_window_ms){
+    char buf[8192];
+    int idle=0;
+    for(;;){
+        ssize_t n = libssh2_channel_read(ch, buf, sizeof(buf));
+        if(n>0){
+            fwrite(buf,1,(size_t)n,stdout); fflush(stdout);
+            idle=0;                      // got data; reset idle timer
+            continue;
+        }
+        if(n==LIBSSH2_ERROR_EAGAIN){
+            waitsocket(sock, sess, 50);
+            idle+=50;
+            if(idle>=idle_window_ms) break;
+            continue;
+        }
+        // n==0 no data and channel open; treat as idle
+        if(n==0){
+            waitsocket(sock, sess, 50);
+            idle+=50;
+            if(idle>=idle_window_ms) break;
+            continue;
+        }
+        // n<0 fatal
+        break;
+    }
 }
 
-// Receive a line from client (handles both \n and \r\n)
-static int recv_line(client_t c, char *buf, size_t bufsz) {
-    size_t u = 0;
-    while (u + 1 < bufsz) {
-        char ch;
-        ssize_t r = io_read(c, &ch, 1);
-        if (r <= 0) return -1;
-        if (ch == '\n') { buf[u] = '\0'; return (int)u; }
-        if (ch != '\r') buf[u++] = ch;
+/* ---------- local filesystem commands (client-side) ---------- */
+static void l_pwd(void){
+    char cwd[4096];
+#ifdef _WIN32
+    if(!_getcwd(cwd,sizeof cwd)) { perror("getcwd"); return; }
+#else
+    if(!getcwd(cwd,sizeof cwd)) { perror("getcwd"); return; }
+#endif
+    printf("%s\n", cwd);
+}
+static void l_ls(void){
+    DIR* d = opendir(".");
+    if(!d){ perror("opendir"); return; }
+    struct dirent* e;
+    while((e = readdir(d))){
+        if(strcmp(e->d_name,".") && strcmp(e->d_name,".."))
+            printf("%s\n", e->d_name);
     }
-    buf[bufsz - 1] = '\0';
-    return (int)u;
+    closedir(d);
+}
+static void l_cd(const char* dir){
+    if(!dir||!*dir){ fprintf(stderr,"lcd <dir>\n"); return; }
+#ifdef _WIN32
+    if(_chdir(dir)!=0) perror("lcd");
+#else
+    if(chdir(dir)!=0) perror("lcd");
+#endif
+}
+static void l_mkdir(const char* d){
+    if(!d||!*d){ fprintf(stderr,"lmkdir <dir>\n"); return; }
+#ifdef _WIN32
+    if(_mkdir(d)!=0) perror("lmkdir");
+#else
+    if(mkdir(d,0755)!=0) perror("lmkdir");
+#endif
+}
+static void l_rename(const char* a, const char* b){
+    if(!a||!b){ fprintf(stderr,"lrename <old> <new>\n"); return; }
+    if(rename(a,b)!=0) perror("lrename");
+}
+static void l_rm(const char* p){
+    if(!p||!*p){ fprintf(stderr,"lrm <path>\n"); return; }
+#ifdef _WIN32
+    if(_unlink(p)!=0) perror("lrm");
+#else
+    if(remove(p)!=0) perror("lrm");
+#endif
 }
 
-// Receive exactly N bytes and save to file
-static int recv_n_to_file(client_t c, const char* fname, long long nbytes) {
-    FILE *fp = fopen(fname, "wb");
-    if (!fp) { perror("fopen for writing"); return -1; }
+/* send local file to server using server's write_file protocol */
+static int send_file_protocol(int sock, LIBSSH2_SESSION* sess, LIBSSH2_CHANNEL* ch,
+                              const char* local_path, const char* remote_path){
+    FILE* f = fopen(local_path,"rb");
+    if(!f){ perror("open local"); return -1; }
+    if(!remote_path) remote_path = local_path;
 
-    char buf[4096];
-    long long remaining = nbytes;
+    // get size
+    if(fseek(f,0,SEEK_END)!=0){ perror("fseek"); fclose(f); return -1; }
+    long long sz = ftell(f);
+    if(sz<0){ perror("ftell"); fclose(f); return -1; }
+    fseek(f,0,SEEK_SET);
 
-    while (remaining > 0) {
-        size_t want = (remaining > (long long)sizeof(buf)) ? sizeof(buf) : (size_t)remaining;
-        ssize_t got = io_read(c, buf, want);
-        if (got <= 0) {
-            fprintf(stderr, "[Child %d] Receive error during file transfer\n", getpid());
-            fclose(fp);
-            unlink(fname);
-            return -1;
-        }
-        if (fwrite(buf, 1, (size_t)got, fp) != (size_t)got) {
-            fprintf(stderr, "[Child %d] Write error during file transfer\n", getpid());
-            fclose(fp);
-            unlink(fname);
-            return -1;
-        }
-        remaining -= got;
+    char hdr[4096];
+    snprintf(hdr,sizeof hdr,"write_file\n%s\nSIZE %lld\n", remote_path, sz);
+
+    if(chan_write_all(ch, hdr, strlen(hdr))!=0){ fclose(f); return -1; }
+
+    // stream file
+    char buf[65536];
+    long long left = sz;
+    while(left>0){
+        size_t n = (size_t)((left>(long long)sizeof(buf))? sizeof(buf) : left);
+        size_t r = fread(buf,1,n,f);
+        if(r==0){ fclose(f); return -1; }
+        if(chan_write_all(ch, buf, r)!=0){ fclose(f); return -1; }
+        left -= (long long)r;
     }
+    fclose(f);
 
-    fclose(fp);
-    printf("[Child %d] File '%s' received successfully (%lld bytes)\n",
-           getpid(), fname, nbytes);
+    // read server response
+    chan_drain_print(sock, sess, ch, 300);
     return 0;
 }
 
-// Handle individual commands from client
-static void handle_command(client_t client, char *cmdline) {
-    printf("[Child %d] Handling command: '%s'\n", getpid(), cmdline);
-
-    if (strcmp(cmdline, "spwd") == 0) {
-        char cwd[PATH_MAX];
-        if (getcwd(cwd, sizeof(cwd))) {
-            if (starts_with(cwd, BASE_DIR)) {
-                const char *rel = cwd + strlen(BASE_DIR);
-                if (*rel == '\0') rel = "/";
-                io_dprintf(client, "Current directory: %s\n", rel);
-            } else {
-                io_dprintf(client, "Current directory: %s\n", cwd);
-            }
-        } else {
-            send_str(client, "Failed to get current directory\n");
-        }
-        return;
-    }
-
-    if (strncmp(cmdline, "scd ", 4) == 0) {
-        const char *target_dir = cmdline + 4;
-        if (secure_cd(target_dir) == 0) send_str(client, "Directory changed successfully\n");
-        else send_str(client, "Failed to change directory (access denied or not found)\n");
-        return;
-    }
-
-    if (strcmp(cmdline, "sls") == 0) {
-        DIR *dir = opendir(".");
-        if (!dir) { send_str(client, "Cannot open directory\n"); return; }
-        struct dirent *entry; int file_count = 0;
-        while ((entry = readdir(dir))) {
-            if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
-            io_dprintf(client, "%s\n", entry->d_name);
-            file_count++;
-        }
-        closedir(dir);
-        if (file_count == 0) send_str(client, "(directory is empty)\n");
-        return;
-    }
-
-    if (strncmp(cmdline, "smkdir ", 7) == 0) {
-        const char *dir_name = cmdline + 7;
-        if (mkdir(dir_name, 0755) == 0) send_str(client, "Directory created successfully\n");
-        else send_str(client, "Failed to create directory\n");
-        return;
-    }
-
-    if (strncmp(cmdline, "srm ", 4) == 0) {
-        const char *target_path = cmdline + 4;
-        char canon[PATH_MAX];
-        if (!realpath(target_path, canon) || !secure_path_in_base(canon)) {
-            send_str(client, "Access denied - path outside allowed area\n");
-            return;
-        }
-        if (delete_directory(canon) == 0) send_str(client, "Successfully deleted\n");
-        else send_str(client, "Failed to delete\n");
-        return;
-    }
-
-    if (strncmp(cmdline, "srename ", 8) == 0) {
-        char tmp[PATH_MAX * 2 + 16];
-        strncpy(tmp, cmdline + 8, sizeof(tmp)-1); tmp[sizeof(tmp)-1] = '\0';
-        char *old_name = strtok(tmp, " \t\r\n");
-        char *new_name = strtok(NULL, " \t\r\n");
-        if (old_name && new_name) {
-            char old_canon[PATH_MAX];
-            // Only check if old file exists and is accessible
-            if (realpath(old_name, old_canon) && secure_path_in_base(old_canon)) {
-                // For new name, build the full path manually and check if parent dir exists
-                char new_path[PATH_MAX];
-                if (new_name[0] == '/') {
-                    snprintf(new_path, sizeof(new_path), "%s%s", BASE_DIR, new_name);
-                } else {
-                    if (!getcwd(new_path, sizeof(new_path))) {
-                        send_str(client, "Failed to get current directory\n");
-                        return;
-                    }
-                    size_t len = strlen(new_path);
-                    if (len + 1 + strlen(new_name) < sizeof(new_path)) {
-                        strcat(new_path, "/");
-                        strcat(new_path, new_name);
-                    } else {
-                        send_str(client, "New path too long\n");
-                        return;
-                    }
-                }
-                
-                // Check if new path is within base directory
-                if (secure_path_in_base(dirname(strdup(new_path))) &&
-                    rename(old_canon, new_path) == 0) {
-                    send_str(client, "Successfully renamed\n");
-                } else {
-                    send_str(client, "Rename failed (check permissions and paths)\n");
-                }
-            } else {
-                send_str(client, "Source file not found or access denied\n");
-            }
-        } else send_str(client, "Invalid rename command format\n");
-        return;
-    }
-
-    if (strcmp(cmdline, "write_file") == 0) {
-        char filename[PATH_MAX];
-        if (recv_line(client, filename, sizeof(filename)) < 0 || filename[0] == '\0') {
-            send_str(client, "Error: Could not receive filename\n"); return;
-        }
-        char size_line[128];
-        if (recv_line(client, size_line, sizeof(size_line)) < 0) {
-            send_str(client, "Error: Could not receive file size\n"); return;
-        }
-        long long file_size = -1;
-        if (sscanf(size_line, "SIZE %lld", &file_size) != 1 || file_size < 0) {
-            send_str(client, "Error: Invalid file size format\n"); return;
-        }
-        printf("[Child %d] Receiving file '%s' of size %lld bytes\n",
-               getpid(), filename, file_size);
-        if (recv_n_to_file(client, filename, file_size) == 0)
-            send_str(client, "File uploaded successfully\n");
-        else
-            send_str(client, "File upload failed\n");
-        return;
-    }
-
-    send_str(client, "Unknown command\n");
+/* ---------- main ---------- */
+static void usage(const char* prog){
+    printf("Usage: %s <host> <port> <user> <pass>\n", prog);
+    printf("\nRemote (server) commands:\n");
+    printf("  spwd | sls | scd <dir> | smkdir <d> | srename <a> <b> | srm <p>\n");
+    printf("  send_file <local> [remote]\n");
+    printf("\nLocal (client) commands:\n");
+    printf("  lpwd | lls | lcd <dir> | lmkdir <d> | lrename <a> <b> | lrm <p>\n");
+    printf("  quit\n");
 }
 
-// Handle a single client connection (runs in child process)
-static void handle_client(client_t client, struct sockaddr_in client_addr) {
-    printf("[Child %d] Handling client %s:%d\n",
-           getpid(), inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port));
+int main(int argc, char** argv){
+    if(argc<5){ usage(argv[0]); return 1; }
+    const char* host=argv[1];
+    int   port=atoi(argv[2]);
+    const char* user=argv[3];
+    const char* pass=argv[4];
 
-    if (chdir(BASE_DIR) != 0) {
-        perror("chdir to base directory");
-        exit(1);
+    int sock = tcp_connect(host, port);
+
+    if(libssh2_init(0)!=0) die("libssh2_init");
+    LIBSSH2_SESSION* sess = libssh2_session_init();
+    if(!sess) die("session_init");
+    libssh2_session_set_blocking(sess, 0);
+
+    if(libssh2_session_handshake(sess, sock)) die("handshake");
+    if(libssh2_userauth_password(sess, user, pass)){
+        fprintf(stderr,"auth failed\n"); return 1;
     }
 
-    char command_line[2048];
-    for (;;) {
-        int result = recv_line(client, command_line, sizeof(command_line));
-        if (result <= 0) {
-            printf("[Child %d] Client disconnected\n", getpid());
-            break;
-        }
-        if (command_line[0] == '\0') {
-            send_str(client, "Empty command received\n");
+    LIBSSH2_CHANNEL* ch = libssh2_channel_open_session(sess);
+    if(!ch) die("channel_open_session");
+    // no PTY; plain line protocol
+    // If your server required PTY+SHELL, uncomment:
+    // libssh2_channel_request_pty(ch, "vt100");
+    // libssh2_channel_shell(ch);
+
+    // interactive loop
+    char line[8192];
+    for(;;){
+        printf("client> "); fflush(stdout);
+        if(!fgets(line, sizeof line, stdin)) break;
+
+        // trim
+        size_t L = strlen(line);
+        while(L && (line[L-1]=='\n' || line[L-1]=='\r')) line[--L]=0;
+
+        if(L==0) continue;
+        if(strcmp(line,"quit")==0) break;
+
+        // parse
+        char *cmd = strtok(line," \t");
+        char *a1  = strtok(NULL," \t");
+        char *a2  = strtok(NULL," \t");
+
+        /* local commands */
+        if(strcmp(cmd,"lpwd")==0){ l_pwd(); continue; }
+        if(strcmp(cmd,"lls")==0){ l_ls(); continue; }
+        if(strcmp(cmd,"lcd")==0){ l_cd(a1); continue; }
+        if(strcmp(cmd,"lmkdir")==0){ l_mkdir(a1); continue; }
+        if(strcmp(cmd,"lrename")==0){ l_rename(a1,a2); continue; }
+        if(strcmp(cmd,"lrm")==0){ l_rm(a1); continue; }
+
+        /* client convenience -> server protocol */
+        if(strcmp(cmd,"send_file")==0){
+            if(!a1){ fprintf(stderr,"send_file <local> [remote]\n"); continue; }
+            if(send_file_protocol(sock, sess, ch, a1, a2)!=0)
+                fprintf(stderr,"send_file failed\n");
             continue;
         }
-        handle_command(client, command_line);
-    }
 
-    printf("[Child %d] Client handler finished\n", getpid());
-    exit(0);
-}
-
-int main(void) {
-    printf("=== Multi-Client File Server (SSH) ===\n");
-
-    /* base dir setup */
-    if (!getcwd(START_DIR, sizeof(START_DIR))) { perror("getcwd"); return 1; }
-    char canonical_path[PATH_MAX];
-    if (realpath(START_DIR, canonical_path)) {
-        strncpy(BASE_DIR, canonical_path, sizeof(BASE_DIR)-1);
-        BASE_DIR[sizeof(BASE_DIR)-1] = '\0';
-    } else {
-        strncpy(BASE_DIR, START_DIR, sizeof(BASE_DIR)-1);
-        BASE_DIR[sizeof(BASE_DIR)-1] = '\0';
-    }
-    printf("Base directory: %s\n", BASE_DIR);
-    printf("Server will accept SSH connections on port 5000\n");
-
-    /* SIGCHLD handler */
-    struct sigaction sa;
-    sa.sa_handler = sigchld_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_RESTART;
-    if (sigaction(SIGCHLD, &sa, NULL) == -1) { perror("sigaction"); return 1; }
-
-    /* --- libssh server setup --- */
-    int port = 5000;
-    ssh_bind sb = ssh_bind_new();
-    if (!sb) { fprintf(stderr, "ssh_bind_new failed\n"); return 1; }
-
-    /* Configure SSH options - remove ED25519 key to fix compatibility */
-    ssh_bind_options_set(sb, SSH_BIND_OPTIONS_BINDADDR, "0.0.0.0");
-    ssh_bind_options_set(sb, SSH_BIND_OPTIONS_BINDPORT, &port);
-    ssh_bind_options_set(sb, SSH_BIND_OPTIONS_RSAKEY, "/etc/ssh/ssh_host_rsa_key");
-    ssh_bind_options_set(sb, SSH_BIND_OPTIONS_ECDSAKEY, "/etc/ssh/ssh_host_ecdsa_key");
-    /* Removed ED25519 key - not supported in older libssh versions */
-
-    if (ssh_bind_listen(sb) != SSH_OK) {
-        fprintf(stderr, "listen: %s\n", ssh_get_error(sb));
-        ssh_bind_free(sb);
-        return 1;
-    }
-    printf("Server listening and ready for multiple SSH clients...\n\n");
-
-    for (;;) {
-        ssh_session s = ssh_new();
-        if (ssh_bind_accept(sb, s) != SSH_OK) { ssh_free(s); continue; }
-        if (ssh_handle_key_exchange(s) != SSH_OK) { ssh_disconnect(s); ssh_free(s); continue; }
-
-        /* password auth - using correct deprecated API */
-        int authed = 0;
-        for (ssh_message m; (m = ssh_message_get(s)) != NULL; ) {
-            if (ssh_message_type(m) == SSH_REQUEST_AUTH &&
-                ssh_message_subtype(m) == SSH_AUTH_METHOD_PASSWORD) {
-                const char *u = ssh_message_auth_user(m);
-                /* Use the deprecated API correctly - pass message, not session */
-                const char *p = ssh_message_auth_password(m);
-                
-                if (u && p && strcmp(u, "ege") == 0 && strcmp(p, "test") == 0) {
-                    ssh_message_auth_reply_success(m, 0);
-                    authed = 1;
-                    ssh_message_free(m);
-                    break;
-                }
-                ssh_message_auth_set_methods(m, SSH_AUTH_METHOD_PASSWORD);
-                ssh_message_reply_default(m);
-            } else {
-                ssh_message_auth_set_methods(m, SSH_AUTH_METHOD_PASSWORD);
-                ssh_message_reply_default(m);
+        /* raw pass-through to server for s* commands */
+        if(cmd[0]=='s'){                 // spwd, sls, scd, smkdir, srename, srm, write_file (manual)
+            // reconstruct original line with args and newline
+            char out[8192];
+            if(a1 && a2) snprintf(out,sizeof out,"%s %s %s\n",cmd,a1,a2);
+            else if(a1) snprintf(out,sizeof out,"%s %s\n",cmd,a1);
+            else snprintf(out,sizeof out,"%s\n",cmd);
+            if(chan_write_all(ch, out, strlen(out))!=0){
+                fprintf(stderr,"write failed\n"); break;
             }
-            ssh_message_free(m);
-        }
-        if (!authed) { ssh_disconnect(s); ssh_free(s); continue; }
-
-        /* open session channel */
-        ssh_channel ch = NULL;
-        for (ssh_message m; (m = ssh_message_get(s)) != NULL; ) {
-            if (ssh_message_type(m) == SSH_REQUEST_CHANNEL_OPEN &&
-                ssh_message_subtype(m) == SSH_CHANNEL_SESSION) {
-                ch = ssh_message_channel_request_open_reply_accept(m);
-                ssh_message_free(m);
-                break;
-            }
-            ssh_message_reply_default(m);
-            ssh_message_free(m);
-        }
-        if (!ch) { ssh_disconnect(s); ssh_free(s); continue; }
-
-        /* optional PTY + SHELL */
-        for (ssh_message m; (m = ssh_message_get(s)) != NULL; ) {
-            if (ssh_message_type(m) == SSH_REQUEST_CHANNEL &&
-                ssh_message_subtype(m) == SSH_CHANNEL_REQUEST_PTY) {
-                ssh_message_channel_request_reply_success(m);
-            } else if (ssh_message_type(m) == SSH_REQUEST_CHANNEL &&
-                       ssh_message_subtype(m) == SSH_CHANNEL_REQUEST_SHELL) {
-                ssh_message_channel_request_reply_success(m);
-                ssh_message_free(m);
-                break;
-            } else {
-                ssh_message_reply_default(m);
-            }
-            ssh_message_free(m);
-        }
-
-        /* build client_addr - use socket info instead of unavailable functions */
-        struct sockaddr_in client_addr;
-        memset(&client_addr, 0, sizeof(client_addr));
-        client_addr.sin_family = AF_INET;
-        
-        /* Get socket from session and extract peer address */
-        socket_t sock = ssh_get_fd(s);
-        if (sock >= 0) {
-            struct sockaddr_in peer_addr;
-            socklen_t peer_len = sizeof(peer_addr);
-            if (getpeername(sock, (struct sockaddr*)&peer_addr, &peer_len) == 0) {
-                client_addr = peer_addr;
-            }
-        }
-
-        /* fork per client */
-        pid_t child_pid = fork();
-        if (child_pid == 0) {
-            /* child */
-            handle_client(ch, client_addr);
-
-            /* cleanups if handle_client returns */
-            ssh_channel_send_eof(ch);
-            ssh_channel_close(ch);
-            ssh_channel_free(ch);
-            ssh_disconnect(s);
-            ssh_free(s);
-            _exit(0);
-        } else if (child_pid > 0) {
-            /* parent */
-            printf("[Main] Forked child process %d for client\n", child_pid);
-            ssh_channel_close(ch);
-            ssh_channel_free(ch);
-            ssh_disconnect(s);
-            ssh_free(s);
-            continue;
-        } else {
-            perror("fork");
-            ssh_channel_close(ch);
-            ssh_channel_free(ch);
-            ssh_disconnect(s);
-            ssh_free(s);
+            chan_drain_print(sock, sess, ch, 300);
             continue;
         }
+
+        fprintf(stderr,"Unknown command. Type s* for server or l* for local.\n");
     }
+
+    libssh2_channel_send_eof(ch);
+    libssh2_channel_close(ch);
+    libssh2_channel_free(ch);
+    libssh2_session_disconnect(sess,"bye");
+    libssh2_session_free(sess);
+    libssh2_exit();
+
+#ifdef _WIN32
+    closesocket(sock);
+    WSACleanup();
+#else
+    close(sock);
+#endif
+    return 0;
 }
