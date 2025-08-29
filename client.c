@@ -177,32 +177,34 @@ static void l_rm(const char* p){
 #endif
 }
 
-/* send local file to server using server's write_file protocol */
 /* send local file to server using our write_file protocol.
    If remote_path ends with '/' or '\' (or is empty), append the local basename. */
 static int send_file_protocol(int sock, LIBSSH2_SESSION* sess, LIBSSH2_CHANNEL* ch,
                               const char* local_path, const char* remote_path)
 {
-    if (!local_path || !*local_path) { fprintf(stderr, "send_file: missing local path\n"); return -1; }
+    if (!local_path || !*local_path) { fprintf(stderr,"send_file: missing local path\n"); return -1; }
 
-    /* stat for size */
-#ifdef _WIN32
-    struct _stat64 st;
-    if (_stat64(local_path, &st) != 0) { perror("stat local"); return -1; }
-    long long sz = (long long)st.st_size;
-#else
-    struct stat st;
-    if (stat(local_path, &st) != 0) { perror("stat local"); return -1; }
-    long long sz = (long long)st.st_size;
-#endif
-
+    /* open first, then get size via fseeko/ftello (reliable on Windows too) */
     FILE* f = fopen(local_path, "rb");
     if (!f) { perror("open local"); return -1; }
 
-    /* figure remote file name */
+#if defined(_WIN32)
+    _fseeki64(f, 0, SEEK_END);
+    long long sz = _ftelli64(f);
+    _fseeki64(f, 0, SEEK_SET);
+#else
+    if (fseeko(f, 0, SEEK_END) != 0) { perror("fseeko"); fclose(f); return -1; }
+    off_t tf = ftello(f);
+    if (tf < 0) { perror("ftello"); fclose(f); return -1; }
+    long long sz = (long long)tf;
+    if (fseeko(f, 0, SEEK_SET) != 0) { perror("fseeko"); fclose(f); return -1; }
+#endif
+    if (sz < 0) { fprintf(stderr,"size error\n"); fclose(f); return -1; }
+
+    /* build remote filename; append basename if remote_path ends with slash or is empty */
     const char *base = strrchr(local_path, '\\');
     if (!base) base = strrchr(local_path, '/');
-    base = base ? base + 1 : local_path;
+    base = base ? base+1 : local_path;
 
     char remote_fixed[4096];
     if (!remote_path || !*remote_path) {
@@ -216,29 +218,29 @@ static int send_file_protocol(int sock, LIBSSH2_SESSION* sess, LIBSSH2_CHANNEL* 
         }
     }
 
-    /* header: command + filename + size */
+    /* send header */
     char hdr[4096];
     int k = snprintf(hdr, sizeof hdr, "write_file\n%s\nSIZE %lld\n", remote_fixed, sz);
-    if (k <= 0 || k >= (int)sizeof(hdr)) { fclose(f); fprintf(stderr, "header error\n"); return -1; }
+    if (k <= 0 || k >= (int)sizeof(hdr)) { fclose(f); fprintf(stderr,"header error\n"); return -1; }
+    if (chan_write_all(ch, hdr, (size_t)k) != 0) { fclose(f); fprintf(stderr,"send header failed\n"); return -1; }
 
-    if (chan_write_all(ch, hdr, (size_t)k) != 0) { fclose(f); fprintf(stderr, "send header failed\n"); return -1; }
-
-    /* stream bytes */
+    /* stream bytes exactly */
     char buf[65536];
     long long left = sz;
     while (left > 0) {
         size_t want = (size_t)((left > (long long)sizeof(buf)) ? sizeof(buf) : (size_t)left);
         size_t r = fread(buf, 1, want, f);
-        if (r == 0) { fclose(f); fprintf(stderr, "read local failed\n"); return -1; }
-        if (chan_write_all(ch, buf, r) != 0) { fclose(f); fprintf(stderr, "write remote failed\n"); return -1; }
+        if (r == 0) { fprintf(stderr,"read local failed\n"); fclose(f); return -1; }
+        if (chan_write_all(ch, (const char*)buf, r) != 0) { fprintf(stderr,"write remote failed\n"); fclose(f); return -1; }
         left -= (long long)r;
     }
     fclose(f);
 
-    /* read server reply until prompt */
+    /* read server reply */
     chan_read_until_prompt(sock, sess, ch, 2000);
     return 0;
 }
+
 
 
 /* ---------- main ---------- */
