@@ -265,6 +265,49 @@ int main(int argc, char** argv){
         if(strcmp(cmd,"lrename")==0){ l_rename(a1,a2); continue; }
         if(strcmp(cmd,"lrm")==0){ l_rm(a1); continue; }
 
+        /* aliases: translate normal cmds -> server cmds */
+        if(strcmp(cmd,"pwd")==0){              // pwd -> spwd
+            const char *out = "spwd\n";
+            if(chan_write_all(ch, out, strlen(out))!=0){ fprintf(stderr,"write failed\n"); break; }
+            chan_drain_print(sock, sess, ch, 300);
+            continue;
+        }
+        if(strcmp(cmd,"ls")==0){               // ls -> sls
+            const char *out = "sls\n";
+            if(chan_write_all(ch, out, strlen(out))!=0){ fprintf(stderr,"write failed\n"); break; }
+            chan_drain_print(sock, sess, ch, 300);
+         continue;
+        }
+        if(strcmp(cmd,"cd")==0){               // cd X -> scd X
+            if(!a1){ fprintf(stderr,"cd <dir>\n"); continue; }
+            char out[4096]; snprintf(out,sizeof out,"scd %s\n", a1);
+            if(chan_write_all(ch, out, strlen(out))!=0){ fprintf(stderr,"write failed\n"); break; }
+            chan_drain_print(sock, sess, ch, 300);
+            continue;
+        }
+        if(strcmp(cmd,"mkdir")==0){            // mkdir X -> smkdir X
+            if(!a1){ fprintf(stderr,"mkdir <dir>\n"); continue; }
+         char out[4096]; snprintf(out,sizeof out,"smkdir %s\n", a1);
+          if(chan_write_all(ch, out, strlen(out))!=0){ fprintf(stderr,"write failed\n"); break; }
+          chan_drain_print(sock, sess, ch, 300);
+          continue;
+        }
+        if(strcmp(cmd,"rm")==0){               // rm X -> srm X
+          if(!a1){ fprintf(stderr,"rm <path>\n"); continue; }
+         char out[4096]; snprintf(out,sizeof out,"srm %s\n", a1);
+          if(chan_write_all(ch, out, strlen(out))!=0){ fprintf(stderr,"write failed\n"); break; }
+         chan_drain_print(sock, sess, ch, 300);
+         continue;
+        }
+        if(strcmp(cmd,"rename")==0){           // rename A B -> srename A B
+         if(!a1||!a2){ fprintf(stderr,"rename <old> <new>\n"); continue; }
+         char out[4096]; snprintf(out,sizeof out,"srename %s %s\n", a1, a2);
+          if(chan_write_all(ch, out, strlen(out))!=0){ fprintf(stderr,"write failed\n"); break; }
+          chan_drain_print(sock, sess, ch, 300);
+          continue;
+        }
+
+
         /* client convenience -> server protocol */
         if(strcmp(cmd,"send_file")==0){
             if(!a1){ fprintf(stderr,"send_file <local> [remote]\n"); continue; }
