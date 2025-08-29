@@ -160,10 +160,11 @@ static int recv_n_to_file(client_t c, const char* fname, long long nbytes) {
     return 0;
 }
 
-// Handle individual commands from client
+// Handle individual commands from client, always end by printing "> "
 static void handle_command(client_t client, char *cmdline) {
-    printf("[Child %d] Handling command: '%s'\n", getpid(), cmdline);
+    printf("[Session] Handling command: '%s'\n", cmdline);
 
+    // spwd
     if (strcmp(cmdline, "spwd") == 0) {
         char cwd[PATH_MAX];
         if (getcwd(cwd, sizeof(cwd))) {
@@ -177,19 +178,29 @@ static void handle_command(client_t client, char *cmdline) {
         } else {
             send_str(client, "Failed to get current directory\n");
         }
+        send_str(client, "> ");
         return;
     }
 
+    // scd <dir>
     if (strncmp(cmdline, "scd ", 4) == 0) {
         const char *target_dir = cmdline + 4;
-        if (secure_cd(target_dir) == 0) send_str(client, "Directory changed successfully\n");
-        else send_str(client, "Failed to change directory (access denied or not found)\n");
+        if (secure_cd(target_dir) == 0)
+            send_str(client, "Directory changed successfully\n");
+        else
+            send_str(client, "Failed to change directory (access denied or not found)\n");
+        send_str(client, "> ");
         return;
     }
 
+    // sls
     if (strcmp(cmdline, "sls") == 0) {
         DIR *dir = opendir(".");
-        if (!dir) { send_str(client, "Cannot open directory\n"); return; }
+        if (!dir) {
+            send_str(client, "Cannot open directory\n");
+            send_str(client, "> ");
+            return;
+        }
         struct dirent *entry; int file_count = 0;
         while ((entry = readdir(dir))) {
             if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, "..")) continue;
@@ -198,31 +209,39 @@ static void handle_command(client_t client, char *cmdline) {
         }
         closedir(dir);
         if (file_count == 0) send_str(client, "(directory is empty)\n");
+        send_str(client, "> ");
         return;
     }
 
+    // smkdir <name>
     if (strncmp(cmdline, "smkdir ", 7) == 0) {
         const char *dir_name = cmdline + 7;
         if (mkdir(dir_name, 0755) == 0) send_str(client, "Directory created successfully\n");
         else send_str(client, "Failed to create directory\n");
+        send_str(client, "> ");
         return;
     }
 
+    // srm <path>
     if (strncmp(cmdline, "srm ", 4) == 0) {
         const char *target_path = cmdline + 4;
         char canon[PATH_MAX];
         if (!realpath(target_path, canon) || !secure_path_in_base(canon)) {
             send_str(client, "Access denied - path outside allowed area\n");
+            send_str(client, "> ");
             return;
         }
         if (delete_directory(canon) == 0) send_str(client, "Successfully deleted\n");
         else send_str(client, "Failed to delete\n");
+        send_str(client, "> ");
         return;
     }
 
+    // srename <old> <new>
     if (strncmp(cmdline, "srename ", 8) == 0) {
         char tmp[PATH_MAX * 2 + 16];
-        strncpy(tmp, cmdline + 8, sizeof(tmp)-1); tmp[sizeof(tmp)-1] = '\0';
+        strncpy(tmp, cmdline + 8, sizeof(tmp)-1);
+        tmp[sizeof(tmp)-1] = '\0';
         char *old_name = strtok(tmp, " \t\r\n");
         char *new_name = strtok(NULL, " \t\r\n");
         if (old_name && new_name) {
@@ -231,34 +250,48 @@ static void handle_command(client_t client, char *cmdline) {
                 secure_path_in_base(old_canon) && secure_path_in_base(new_canon) &&
                 rename(old_canon, new_canon) == 0) {
                 send_str(client, "Successfully renamed\n");
-            } else send_str(client, "Rename failed (check permissions and paths)\n");
-        } else send_str(client, "Invalid rename command format\n");
+            } else {
+                send_str(client, "Rename failed (check permissions and paths)\n");
+            }
+        } else {
+            send_str(client, "Invalid rename command format\n");
+        }
+        send_str(client, "> ");
         return;
     }
 
+    // write_file  (then: <filename>\n  SIZE <n>\n  <n bytes>)
     if (strcmp(cmdline, "write_file") == 0) {
         char filename[PATH_MAX];
         if (recv_line(client, filename, sizeof(filename)) < 0 || filename[0] == '\0') {
-            send_str(client, "Error: Could not receive filename\n"); return;
+            send_str(client, "Error: Could not receive filename\n");
+            send_str(client, "> ");
+            return;
         }
         char size_line[128];
         if (recv_line(client, size_line, sizeof(size_line)) < 0) {
-            send_str(client, "Error: Could not receive file size\n"); return;
+            send_str(client, "Error: Could not receive file size\n");
+            send_str(client, "> ");
+            return;
         }
         long long file_size = -1;
         if (sscanf(size_line, "SIZE %lld", &file_size) != 1 || file_size < 0) {
-            send_str(client, "Error: Invalid file size format\n"); return;
+            send_str(client, "Error: Invalid file size format\n");
+            send_str(client, "> ");
+            return;
         }
-        printf("[Child %d] Receiving file '%s' of size %lld bytes\n",
-               getpid(), filename, file_size);
+        printf("[Session] Receiving file '%s' of size %lld bytes\n", filename, file_size);
         if (recv_n_to_file(client, filename, file_size) == 0)
             send_str(client, "File uploaded successfully\n");
         else
             send_str(client, "File upload failed\n");
+        send_str(client, "> ");
         return;
     }
 
+    // Unknown
     send_str(client, "Unknown command\n");
+    send_str(client, "> ");
 }
 
 // Handle a single client connection (runs in child process)

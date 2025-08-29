@@ -91,45 +91,40 @@ static int chan_write_all(LIBSSH2_CHANNEL* ch, const char* buf, size_t len){
 /* read and print any pending data for idle_window_ms without new bytes */
 static void chan_read_until_prompt(int sock, LIBSSH2_SESSION* sess, LIBSSH2_CHANNEL* ch, int timeout_ms){
     char buf[4096];
-    char tail[4] = {0,0,0,0};   // sliding window to detect "\n> "
+    char tail[256]; size_t tlen = 0;
     int idle = 0;
     for(;;){
         ssize_t n = libssh2_channel_read(ch, buf, sizeof(buf));
         if(n > 0){
-            fwrite(buf, 1, (size_t)n, stdout); fflush(stdout);
-            // update tail
-            for(ssize_t i=0;i<n;i++){
-                tail[0]=tail[1]; tail[1]=tail[2]; tail[2]=tail[3]; tail[3]=buf[i];
-                if(tail[0]=='\n' && tail[1]=='>'
-                   && (tail[2]==' ' || tail[2]=='\r' || tail[2]=='\n')) {
-                    return; // saw "\n> " (or CR/LF variants)
-                }
-                if((tail[2]=='\n' || tail[2]=='\r') && tail[3]=='>') {
-                    // handle case where prompt begins a new line as "> "
-                    // peek next read to print the following space if any, then return
-                    // but simplest: just return here; next command will print space anyway
-                    return;
-                }
+            fwrite(buf,1,(size_t)n,stdout); fflush(stdout);
+            /* keep last up to 255 bytes and check for prompts */
+            size_t keep = (tlen + (size_t)n > sizeof(tail)-1) ? sizeof(tail)-1 : tlen + (size_t)n;
+            if(keep < (size_t)n){ /* new chunk longer than window */
+                memcpy(tail, buf + (n - (ssize_t)keep), keep);
+            } else {
+                size_t shift = keep - (size_t)n;
+                memmove(tail, tail + (tlen - shift), shift);
+                memcpy(tail + shift, buf, (size_t)n);
+            }
+            tlen = keep; tail[tlen] = '\0';
+
+            if (strstr(tail, "\n> ") || strstr(tail, "> ")
+                || strstr(tail, "\nEnter command:") || strstr(tail, "Enter command:")) {
+                return;
             }
             idle = 0;
             continue;
         }
-        if(n == LIBSSH2_ERROR_EAGAIN){
+        if(n == LIBSSH2_ERROR_EAGAIN || n == 0){
             waitsocket(sock, sess, 50);
             idle += 50;
             if(idle >= timeout_ms) return;
             continue;
         }
-        if(n == 0){
-            waitsocket(sock, sess, 50);
-            idle += 50;
-            if(idle >= timeout_ms) return;
-            continue;
-        }
-        // n < 0 fatal
-        return;
+        return; /* n < 0 */
     }
 }
+
 
 
 /* ---------- local filesystem commands (client-side) ---------- */
