@@ -197,18 +197,18 @@ static int send_file_protocol(int sock, LIBSSH2_SESSION* sess, LIBSSH2_CHANNEL* 
 
     // stream file
     char buf[65536];
-        long long left = sz;
-        while (left > 0) {
-            size_t want = (size_t)((left > (long long)sizeof(buf)) ? sizeof(buf) : (size_t)left);
-            size_t r = fread(buf, 1, want, f);
-            if (r == 0) { fclose(f); return -1; }
-            if (chan_write_all(ch, buf, r) != 0) { fclose(f); return -1; }
-            left -= (long long)r;
+    long long left = sz;
+    while (left > 0) {
+        size_t want = (size_t)((left > (long long)sizeof(buf)) ? sizeof(buf) : (size_t)left);
+        size_t r = fread(buf, 1, want, f);
+        if (r == 0) { fclose(f); return -1; }
+        if (chan_write_all(ch, buf, r) != 0) { fclose(f); return -1; }
+        left -= (long long)r;
 }
     fclose(f);
 
     // read server response
-    chan_read_until_prompt(sock, sess, ch, 1000);
+    chan_read_until_prompt(sock, sess, ch, 1500);
     return 0;
 }
 
@@ -318,6 +318,13 @@ int main(int argc, char** argv){
           chan_read_until_prompt(sock, sess, ch, 1000);
           continue;
         }
+        if (strcmp(cmd, "exit") == 0) {
+        const char *out = "exit\n";
+        chan_write_all(ch, out, strlen(out));
+        chan_read_until_prompt(sock, sess, ch, 500);  // best-effort
+        break;
+        }
+
 
 
         /* client convenience -> server protocol */

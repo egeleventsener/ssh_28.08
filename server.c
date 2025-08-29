@@ -318,6 +318,10 @@ static void handle_client(client_t client, struct sockaddr_in client_addr) {
             send_str(client, "Empty command received\n");
             continue;
         }
+        if (strcmp(command_line, "exit") == 0) {
+            send_str(client, "Bye.\n");
+            return;  
+        }
         handle_command(client, command_line);
     }
 
