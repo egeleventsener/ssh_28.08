@@ -234,6 +234,8 @@ int main(int argc, char** argv){
 
     LIBSSH2_CHANNEL* ch = libssh2_channel_open_session(sess);
     if(!ch) die("channel_open_session");
+    if (libssh2_channel_request_pty(ch, "vt100")) die("pty");
+    if (libssh2_channel_shell(ch)) die("shell");
     // no PTY; plain line protocol
     // If your server required PTY+SHELL, uncomment:
     // libssh2_channel_request_pty(ch, "vt100");
