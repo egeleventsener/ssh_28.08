@@ -246,12 +246,8 @@ int main(int argc, char** argv){
     if(!ch) die("channel_open_session");
     if (libssh2_channel_request_pty(ch, "vt100")) die("pty");
     if (libssh2_channel_shell(ch)) die("shell");
-    // no PTY; plain line protocol
-    // If your server required PTY+SHELL, uncomment:
-    // libssh2_channel_request_pty(ch, "vt100");
-    // libssh2_channel_shell(ch);
+    chan_read_until_prompt(sock, sess, ch, 1500);
 
-    // interactive loop
     char line[8192];
     for(;;){
         printf("client> "); fflush(stdout);

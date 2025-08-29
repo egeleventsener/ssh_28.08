@@ -290,18 +290,23 @@ static void handle_command(client_t client, char *cmdline) {
     send_str(client, "> ");
 }
 
-// Handle a single client connection (runs in child process)
+// Handle a single client connection (thread context)
 static void handle_client(client_t client, struct sockaddr_in client_addr) {
     printf("[Session] Handling client %s:%d (tid=%lu)\n",
-       inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port),
-       (unsigned long)pthread_self());
-    send_str(client, "Connected to the server \n");
-    send_str(client, "> ");
-    send_str(client, "Enter command:\n");
+           inet_ntoa(client_addr.sin_addr), ntohs(client_addr.sin_port),
+           (unsigned long)pthread_self());
+
     if (chdir(BASE_DIR) != 0) {
         perror("chdir to base directory");
-        exit(1);
+        send_str(client, "Server error: cannot change to base directory\n");
+        return;
     }
+
+    // banner + initial prompt (no "Enter command:")
+    send_str(client,
+        "Connected to file server over SSH.\n"
+        "Commands: spwd, sls, smkdir <d>, srename <a> <b>, srm <p>, write_file, exit\n");
+    send_str(client, "> ");
 
     char command_line[2048];
     for (;;) {
@@ -310,21 +315,24 @@ static void handle_client(client_t client, struct sockaddr_in client_addr) {
             printf("[Session] Client disconnected (tid=%lu)\n", (unsigned long)pthread_self());
             break;
         }
+
         if (command_line[0] == '\0') {
             send_str(client, "Empty command received\n");
             send_str(client, "> ");
             continue;
-
         }
+
         if (strcmp(command_line, "exit") == 0) {
             send_str(client, "Bye.\n");
-            return;  
+            return; // thread cleanup happens in caller
         }
-        handle_command(client, command_line);
+
+        handle_command(client, command_line); // this prints "> " at the end
     }
 
-        printf("[Session] Client handler finished (tid=%lu)\n", (unsigned long)pthread_self());
+    printf("[Session] Client handler finished (tid=%lu)\n", (unsigned long)pthread_self());
 }
+
 
 int main(void) {
     printf("=== Multi-Client File Server (SSH) ===\n");
