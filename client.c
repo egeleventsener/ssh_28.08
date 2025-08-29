@@ -180,35 +180,44 @@ static void l_rm(const char* p){
 /* send local file to server using server's write_file protocol */
 static int send_file_protocol(int sock, LIBSSH2_SESSION* sess, LIBSSH2_CHANNEL* ch,
                               const char* local_path, const char* remote_path){
+    if(!remote_path || !*remote_path) remote_path = local_path;
+
+    /* robust file size via stat */
+#ifdef _WIN32
+    struct _stat64 st;
+    if(_stat64(local_path, &st) != 0){ perror("stat local"); return -1; }
+    long long sz = (long long)st.st_size;
+#else
+    struct stat st;
+    if(stat(local_path, &st) != 0){ perror("stat local"); return -1; }
+    long long sz = (long long)st.st_size;
+#endif
+    fprintf(stderr, "[client] sending '%s' -> '%s' size=%lld bytes\n",
+            local_path, remote_path, sz);
+
     FILE* f = fopen(local_path,"rb");
     if(!f){ perror("open local"); return -1; }
-    if(!remote_path) remote_path = local_path;
 
-    // get size
-    if(fseek(f,0,SEEK_END)!=0){ perror("fseek"); fclose(f); return -1; }
-    long long sz = ftell(f);
-    if(sz<0){ perror("ftell"); fclose(f); return -1; }
-    fseek(f,0,SEEK_SET);
-
+    /* header: command, filename, size */
     char hdr[4096];
-    snprintf(hdr,sizeof hdr,"write_file\n%s\nSIZE %lld\n", remote_path, sz);
+    int k = snprintf(hdr,sizeof hdr,"write_file\n%s\nSIZE %lld\n", remote_path, sz);
+    if(k <= 0 || k >= (int)sizeof(hdr)){ fclose(f); fprintf(stderr,"header error\n"); return -1; }
+    if(chan_write_all(ch, hdr, (size_t)k) != 0){ fclose(f); return -1; }
 
-    if(chan_write_all(ch, hdr, strlen(hdr))!=0){ fclose(f); return -1; }
-
-    // stream file
+    /* stream file bytes exactly */
     char buf[65536];
     long long left = sz;
-    while (left > 0) {
+    while(left > 0){
         size_t want = (size_t)((left > (long long)sizeof(buf)) ? sizeof(buf) : (size_t)left);
         size_t r = fread(buf, 1, want, f);
-        if (r == 0) { fclose(f); return -1; }
-        if (chan_write_all(ch, buf, r) != 0) { fclose(f); return -1; }
+        if(r == 0){ fclose(f); fprintf(stderr,"read local failed\n"); return -1; }
+        if(chan_write_all(ch, buf, r) != 0){ fclose(f); fprintf(stderr,"write remote failed\n"); return -1; }
         left -= (long long)r;
-}
+    }
     fclose(f);
 
-    // read server response
-    chan_read_until_prompt(sock, sess, ch, 1500);
+    /* read server response until prompt */
+    chan_read_until_prompt(sock, sess, ch, 2000);
     return 0;
 }
 
@@ -332,7 +341,7 @@ int main(int argc, char** argv){
         }
 
         /* raw pass-through to server for s* commands */
-        if(cmd[0]=='s'){                 // spwd, sls, scd, smkdir, srename, srm, write_file (manual)
+        if(cmd[0]=='s'){                 
             // reconstruct original line with args and newline
             char out[8192];
             if(a1 && a2) snprintf(out,sizeof out,"%s %s %s\n",cmd,a1,a2);
