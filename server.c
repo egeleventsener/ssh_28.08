@@ -283,12 +283,6 @@ static void handle_command(client_t client, char *cmdline) {
             /* Get file info for better listing */
             struct stat st;
             char type_char = '?';
-            if (stat(entry->d_name, &st) == 0) {
-                if (S_ISDIR(st.st_mode)) type_char = 'd';
-                else if (S_ISREG(st.st_mode)) type_char = 'f';
-                else if (S_ISLNK(st.st_mode)) type_char = 'l';
-            }
-            
             io_dprintf(client, "  %c %s\n", type_char, entry->d_name);
             file_count++;
         }
